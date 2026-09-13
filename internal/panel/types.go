@@ -41,7 +41,6 @@ func (h *HandshakeResponse) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &aux); err != nil {
 		return err
 	}
-	// If settings is an empty array [], skip unmarshaling it into the struct
 	if len(aux.Settings) > 0 && string(aux.Settings) != "[]" {
 		if err := json.Unmarshal(aux.Settings, &h.Settings); err != nil {
 			return err
@@ -67,12 +66,13 @@ type MachineNode struct {
 	ID   int    `json:"id"`
 	Type string `json:"type"`
 	Name string `json:"name"`
+	Mode string `json:"mode,omitempty"`
 }
 
 // MachineNodesResponse is the response from GET /api/v2/server/machine/nodes.
 type MachineNodesResponse struct {
-	Nodes      []MachineNode      `json:"nodes"`
-	BaseConfig MachineBaseConfig  `json:"base_config"`
+	Nodes      []MachineNode     `json:"nodes"`
+	BaseConfig MachineBaseConfig `json:"base_config"`
 }
 
 // MachineBaseConfig holds polling intervals for machine mode.
@@ -81,10 +81,22 @@ type MachineBaseConfig struct {
 	PullInterval int `json:"pull_interval"`
 }
 
+// RelayConfig defines a protocol-agnostic L4 relay managed by machine mode.
+type RelayConfig struct {
+	ListenIP       string   `json:"listen_ip"`
+	ListenPort     int      `json:"listen_port"`
+	TargetHost     string   `json:"target_host"`
+	TargetPort     int      `json:"target_port"`
+	Networks       []string `json:"networks"`
+	UDPIdleTimeout int      `json:"udp_idle_timeout,omitempty"`
+}
+
 // NodeConfig is the response from GET /api/v1/server/UniProxy/config
 type NodeConfig struct {
 	// NodeID is populated in machine-mode WS events for routing.
 	NodeID          int                    `json:"node_id,omitempty"`
+	Mode            string                 `json:"mode,omitempty"`
+	Relay           *RelayConfig           `json:"relay,omitempty"`
 	Protocol        string                 `json:"protocol"`
 	ListenIP        string                 `json:"listen_ip"`
 	ServerPort      int                    `json:"server_port"`
@@ -94,16 +106,16 @@ type NodeConfig struct {
 	Routes          []RouteRule            `json:"routes"`
 
 	// Kernel settings (Xboard extension)
-	KernelType       string            `json:"kernel_type,omitempty"`      // "singbox" or "xray"
-	KernelLogLevel   string            `json:"kernel_log_level,omitempty"` // "info", "warn", etc.
+	KernelType       string            `json:"kernel_type,omitempty"`
+	KernelLogLevel   string            `json:"kernel_log_level,omitempty"`
 	CustomOutbounds  []OutboundConfig  `json:"custom_outbounds,omitempty"`
 	CustomRoutes     []map[string]any  `json:"custom_routes,omitempty"`
 	CustomRouteRules []CustomRouteRule `json:"custom_route_rules,omitempty"`
 
 	// Certificate settings (Xboard extension)
 	CertConfig *CertConfig `json:"cert_config,omitempty"`
-	AutoTLS    bool        `json:"auto_tls,omitempty"` // Deprecated: use CertConfig
-	Domain     string      `json:"domain,omitempty"`   // Deprecated: use CertConfig
+	AutoTLS    bool        `json:"auto_tls,omitempty"`
+	Domain     string      `json:"domain,omitempty"`
 
 	// Shadowsocks
 	Cipher    string `json:"cipher,omitempty"`
@@ -181,16 +193,16 @@ type BrutalConfig struct {
 // The panel may send the mode field as either "cert_mode" or "mode";
 // a custom UnmarshalJSON handles both.
 type CertConfig struct {
-	CertMode    string            `json:"cert_mode"`    // none, dns, http, self, file, content
-	Domain      string            `json:"domain"`       // Certificate domain
-	Email       string            `json:"email"`        // ACME email
-	DNSProvider string            `json:"dns_provider"` // dns mode: cloudflare, alidns, etc.
-	DNSEnv      map[string]string `json:"dns_env"`      // Provider-specific API keys/tokens
-	HTTPPort    int               `json:"http_port"`    // ACME HTTP-01 local port (default 80)
-	CertFile    string            `json:"cert_file"`    // file mode: path to cert file
-	KeyFile     string            `json:"key_file"`     // file mode: path to key file
-	CertContent string            `json:"cert_content"` // content mode: certificate raw string
-	KeyContent  string            `json:"key_content"`  // content mode: private key raw string
+	CertMode    string            `json:"cert_mode"`
+	Domain      string            `json:"domain"`
+	Email       string            `json:"email"`
+	DNSProvider string            `json:"dns_provider"`
+	DNSEnv      map[string]string `json:"dns_env"`
+	HTTPPort    int               `json:"http_port"`
+	CertFile    string            `json:"cert_file"`
+	KeyFile     string            `json:"key_file"`
+	CertContent string            `json:"cert_content"`
+	KeyContent  string            `json:"key_content"`
 }
 
 func (c *CertConfig) UnmarshalJSON(data []byte) error {
@@ -211,10 +223,10 @@ func (c *CertConfig) UnmarshalJSON(data []byte) error {
 
 // OutboundConfig defines a custom outbound for kernel
 type OutboundConfig struct {
-	Tag      string         `json:"tag"`                 // Unique tag for routing
-	Protocol string         `json:"protocol"`            // vmess, vless, shadowsocks, wireguard, etc.
-	Settings map[string]any `json:"settings,omitempty"`  // Protocol-specific settings
-	ProxyTag string         `json:"proxy_tag,omitempty"` // Chain proxy: next outbound tag
+	Tag      string         `json:"tag"`
+	Protocol string         `json:"protocol"`
+	Settings map[string]any `json:"settings,omitempty"`
+	ProxyTag string         `json:"proxy_tag,omitempty"`
 }
 
 type BaseConfig struct {
@@ -255,8 +267,8 @@ type RouteAction struct {
 type User struct {
 	ID          int    `json:"id"`
 	UUID        string `json:"uuid"`
-	SpeedLimit  int    `json:"speed_limit"`  // Mbps, 0 = unlimited
-	DeviceLimit int    `json:"device_limit"` // max devices, 0 = unlimited
+	SpeedLimit  int    `json:"speed_limit"`
+	DeviceLimit int    `json:"device_limit"`
 }
 
 type UsersResponse struct {
