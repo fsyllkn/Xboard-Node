@@ -35,7 +35,8 @@ docker compose up -d
 ### Installer (Linux systemd)
 
 ```bash
-# The fork installer builds the dev branch by default, so no Release is required.
+# The fork installer uses the dev Release when available and falls back to a
+# cached source build when the Release is not available.
 # Node mode
 curl -fsSL https://raw.githubusercontent.com/fsyllkn/Xboard-Node/dev/install.sh | \
   sudo bash -s -- --mode node --panel https://panel.example.com --token TOKEN --node-id 1

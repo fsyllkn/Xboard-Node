@@ -24,7 +24,7 @@ DEFAULT_HEALTH_PORT=65530
 DEFAULT_KERNEL="singbox"
 DEFAULT_MODE="node"
 DEFAULT_ACTION="install"
-DEFAULT_RELEASE_VERSION="latest"
+DEFAULT_RELEASE_VERSION="${XBOARD_NODE_RELEASE:-dev}"
 DEFAULT_LOG_LEVEL="info"
 DEFAULT_KERNEL_LOG_LEVEL="warn"
 FORK_REPOSITORY_URL="https://github.com/fsyllkn/Xboard-Node.git"
@@ -42,7 +42,8 @@ NODE_TYPE=""
 MACHINE_ID=""
 KERNEL_TYPE="${DEFAULT_KERNEL}"
 RELEASE_VERSION="${DEFAULT_RELEASE_VERSION}"
-BUILD_FROM_SOURCE=1
+BUILD_FROM_SOURCE=0
+RELEASE_ONLY=0
 HEALTH_PORT="${DEFAULT_HEALTH_PORT}"
 HEALTH_ENABLED=1
 RUNTIME_GOMEMLIMIT=""
@@ -62,6 +63,7 @@ SOURCE_DIR=""
 GO_BIN=""
 BUILD_WITH_DOCKER=0
 SOURCE_BUILD_DONE=0
+DOCKER_CACHE_ROOT="/var/cache/xboard-node"
 SERVICE_EXISTED=0
 CLEANUP_DONE=0
 SCRIPT_SOURCE="${BASH_SOURCE[0]:-}"
@@ -197,9 +199,9 @@ usage() {
     --node-type, -T     Explicit node type for node mode
     --kernel, -k        singbox or xray (default: singbox)
     --branch            Fork source branch (default: dev, env: XBOARD_NODE_BRANCH)
-    --source            Build from the fork source (default)
-    --release           Download a fork Release asset instead of building
-    --version           Release version or latest (default: latest)
+    --source            Build from the fork source
+    --release           Require a fork Release asset
+    --version           Release version (default: dev)
     --binary            Use a local xboard-node binary path instead of downloading
     --xbctl-binary      Use a local xbctl binary path instead of downloading
     --health-port       Local health port (default: 65530, use 0 to disable)
@@ -261,10 +263,12 @@ parse_args() {
                 ;;
             --source)
                 BUILD_FROM_SOURCE=1
+                RELEASE_ONLY=0
                 shift
                 ;;
             --release)
                 BUILD_FROM_SOURCE=0
+                RELEASE_ONLY=1
                 shift
                 ;;
             --version)
@@ -559,6 +563,8 @@ ensure_build_toolchain() {
         return
     fi
     if docker_available; then
+        mkdir -p "${DOCKER_CACHE_ROOT}/go-mod" "${DOCKER_CACHE_ROOT}/go-build"
+        chmod 700 "$DOCKER_CACHE_ROOT"
         BUILD_WITH_DOCKER=1
         return
     fi
@@ -596,7 +602,7 @@ build_from_source() {
     local commit_label version_label build_time ldflags
     commit_label=$(git -C "$SOURCE_DIR" rev-parse --short HEAD)
     version_label="$RELEASE_VERSION"
-    if [ "$version_label" = "latest" ]; then
+    if [ "$version_label" = "latest" ] || [ "$version_label" = "dev" ]; then
         version_label="dev-${commit_label}"
     fi
     build_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -610,6 +616,8 @@ build_from_source() {
             -e "BUILD_TIME=${build_time}" \
             -v "${SOURCE_DIR}:/src" \
             -v "${TMP_DIR}:/out" \
+            -v "${DOCKER_CACHE_ROOT}/go-mod:/go/pkg/mod" \
+            -v "${DOCKER_CACHE_ROOT}/go-build:/root/.cache/go-build" \
             -w /src \
             golang:1.26-alpine \
             sh -lc 'export PATH=/usr/local/go/bin:$PATH; CGO_ENABLED=0 GOOS=linux GOARCH="$TARGET_GOARCH" go build -ldflags "-s -w -X main.version=${BUILD_VERSION} -X main.buildTime=${BUILD_TIME}" -tags "with_quic with_utls with_wireguard with_acme with_clash_api" -o /out/xboard-node ./cmd/xboard-node && CGO_ENABLED=0 GOOS=linux GOARCH="$TARGET_GOARCH" go build -ldflags "-s -w -X main.version=${BUILD_VERSION} -X main.buildTime=${BUILD_TIME}" -o /out/xbctl ./cmd/xbctl'; then
@@ -652,13 +660,17 @@ stage_binary() {
     elif [ "$BUILD_FROM_SOURCE" -eq 1 ]; then
         build_from_source
         log_step "Using fork source binary: ${FORK_REPOSITORY_URL}@${FORK_BRANCH}"
-        cp "$TMP_DIR/xboard-node" "$staged"
     else
         resolve_download_url "xboard-node-linux-${ARCH}"
         log_step "Downloading binary: ${DOWNLOAD_URL}"
         if ! curl -fsSL "$DOWNLOAD_URL" -o "$staged"; then
-            log_error "Failed to download binary from ${DOWNLOAD_URL}"
-            exit 1
+            if [ "$RELEASE_ONLY" -eq 1 ]; then
+                log_error "Failed to download binary from ${DOWNLOAD_URL}"
+                exit 1
+            fi
+            log_warn "Fork Release asset unavailable; falling back to source build"
+            BUILD_FROM_SOURCE=1
+            build_from_source
         fi
     fi
     chmod +x "$staged"
@@ -688,13 +700,17 @@ stage_xbctl() {
     elif [ "$BUILD_FROM_SOURCE" -eq 1 ]; then
         build_from_source
         log_step "Using fork source xbctl: ${FORK_REPOSITORY_URL}@${FORK_BRANCH}"
-        cp "$TMP_DIR/xbctl" "$staged"
     else
         resolve_download_url "xbctl-linux-${ARCH}"
         log_step "Downloading xbctl: ${DOWNLOAD_URL}"
         if ! curl -fsSL "$DOWNLOAD_URL" -o "$staged"; then
-            log_error "Failed to download xbctl from ${DOWNLOAD_URL}"
-            exit 1
+            if [ "$RELEASE_ONLY" -eq 1 ]; then
+                log_error "Failed to download xbctl from ${DOWNLOAD_URL}"
+                exit 1
+            fi
+            log_warn "Fork Release asset unavailable; falling back to source build"
+            BUILD_FROM_SOURCE=1
+            build_from_source
         fi
     fi
     chmod +x "$staged"
