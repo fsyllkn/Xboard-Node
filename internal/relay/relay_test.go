@@ -2,8 +2,14 @@ package relay
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"strings"
 	"testing"
@@ -190,6 +196,94 @@ func udpRoundTrip(t *testing.T, port int, payload string) string {
 		t.Fatal(err)
 	}
 	return string(b[:n])
+}
+
+func TestTLSServiceBehindTCPRelay(t *testing.T) {
+	cert := testCertificate(t)
+	listener, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	go func() {
+		for {
+			c, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				b := make([]byte, 1024)
+				n, err := c.Read(b)
+				if err != nil {
+					return
+				}
+				_, _ = io.WriteString(c, "tls:"+string(b[:n]))
+			}(c)
+		}
+	}()
+
+	bPort := listener.Addr().(*net.TCPAddr).Port
+	aPort := freePort(t, "tcp")
+	r, err := New(Config{ListenIP: "127.0.0.1", ListenPort: aPort, TargetHost: "127.0.0.1", TargetPort: bPort, Networks: []string{"tcp"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		if err := r.Run(ctx); err != nil {
+			t.Errorf("run: %v", err)
+		}
+	}()
+	waitTCP(t, aPort)
+
+	client, err := tls.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", aPort), &tls.Config{InsecureSkipVerify: true, ServerName: "localhost", MinVersion: tls.VersionTLS12})
+	if err != nil {
+		t.Fatalf("TLS handshake through relay failed: %v", err)
+	}
+	defer client.Close()
+	if _, err := io.WriteString(client, "encrypted-payload"); err != nil {
+		t.Fatal(err)
+	}
+	_ = client.SetReadDeadline(time.Now().Add(time.Second))
+	b := make([]byte, 1024)
+	n, err := client.Read(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(b[:n]); got != "tls:encrypted-payload" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func testCertificate(t *testing.T) tls.Certificate {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	tmpl := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		NotBefore:    now.Add(-time.Minute),
+		NotAfter:     now.Add(time.Hour),
+		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     []string{"localhost"},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cert
 }
 
 func TestValidation(t *testing.T) {
