@@ -18,16 +18,19 @@ import (
 	"github.com/cedar2025/xboard-node/internal/service"
 )
 
-// nodeHandle tracks a running node service.
+// nodeHandle tracks a running machine task (service node or native relay).
 type nodeHandle struct {
-	cancel  context.CancelFunc
-	done    chan struct{}
-	mailbox *controlplane.NodeMailbox
+	cancel       context.CancelFunc
+	done         chan struct{}
+	mailbox      *controlplane.NodeMailbox
+	mode         string
+	nodeType     string
+	relayUpdates chan *panel.NodeConfig
 }
 
 // Orchestrator manages all nodes bound to a panel machine. It:
 //   - discovers nodes via GET /machine/nodes
-//   - starts / stops Service instances as nodes are added / removed
+//   - starts / stops Service and Relay tasks as nodes are added / removed
 //   - maintains a shared WS connection that demuxes events by node_id
 //   - reports machine-level load via POST /machine/status
 type Orchestrator struct {
@@ -35,10 +38,10 @@ type Orchestrator struct {
 	client *panel.Client // machine-level client (no node_id)
 
 	mu    sync.Mutex
-	nodes map[int]*nodeHandle // node_id → handle
+	nodes map[int]*nodeHandle // node_id -> handle
 
-	// Per-node mailbox keyed by node_id. Shared WS events are aggregated here
-	// and each node service drains the latest state when ready.
+	// Per-service-node mailbox keyed by node_id. Relay tasks do not consume
+	// user/device events and therefore do not register a mailbox.
 	eventsMu  sync.RWMutex
 	mailboxes map[int]*controlplane.NodeMailbox
 	statuses  map[int]chan<- controlplane.StatusChange
@@ -47,8 +50,7 @@ type Orchestrator struct {
 	ws       *panel.WSClient
 	wsCancel context.CancelFunc
 
-	// runCtx is stored from Run() so that onWSEvent can trigger rediscover
-	// for sync.nodes events without blocking the main loop.
+	// runCtx is stored from Run() so that WS/config events can trigger rediscovery.
 	runCtx context.Context
 
 	pullInterval time.Duration
@@ -120,33 +122,102 @@ func (o *Orchestrator) startNode(ctx context.Context, mn panel.MachineNode) {
 		o.mu.Unlock()
 		return
 	}
+	o.mu.Unlock()
+
+	nodeCfg := o.cfg.ExpandMachineNode(mn.ID, mn.Type)
+	perNodeClient := o.client.ForNode(mn.ID)
+
+	// Fetch config before choosing the task implementation. MachineNode.Mode is
+	// a discovery hint; NodeConfig.Mode is authoritative when present.
+	cfgSnapshot, err := perNodeClient.GetConfig()
+	if err != nil {
+		nlog.Core().Warn("machine: initial node config fetch failed",
+			"node_id", mn.ID, "error", err)
+		return
+	}
+	if cfgSnapshot == nil {
+		perNodeClient.ResetConfigETag()
+		cfgSnapshot, err = perNodeClient.GetConfig()
+		if err != nil || cfgSnapshot == nil {
+			nlog.Core().Warn("machine: initial node config unavailable",
+				"node_id", mn.ID, "error", err)
+			return
+		}
+	}
+
+	mode := resolveTaskMode(mn.Mode, cfgSnapshot)
+
+	if mode == taskModeRelay {
+		if cfgSnapshot.Relay == nil {
+			nlog.Core().Error("machine relay config missing relay section", "node_id", mn.ID)
+			return
+		}
+
+		nodeCtx, cancel := context.WithCancel(ctx)
+		done := make(chan struct{})
+		updates := make(chan *panel.NodeConfig, 1)
+		h := &nodeHandle{
+			cancel:       cancel,
+			done:         done,
+			mode:         taskModeRelay,
+			nodeType:     mn.Type,
+			relayUpdates: updates,
+		}
+
+		o.mu.Lock()
+		if _, exists := o.nodes[mn.ID]; exists {
+			o.mu.Unlock()
+			cancel()
+			return
+		}
+		o.nodes[mn.ID] = h
+		o.mu.Unlock()
+
+		nlog.Core().Info(fmt.Sprintf("machine: starting relay %d (%s/%s)",
+			mn.ID, mn.Type, mn.Name))
+
+		go func() {
+			defer close(done)
+			if err := o.runRelayNode(nodeCtx, mn, perNodeClient, cfgSnapshot, updates); err != nil {
+				nlog.Core().Error("machine relay exited with error",
+					"node_id", mn.ID, "error", err)
+			}
+		}()
+		return
+	}
+
+	// Service mode keeps the existing kernel/control-plane lifecycle.
+	if resolved := model.ResolveKernelForTransport(cfgSnapshot.Network, nodeCfg.Kernel.Type); resolved != nodeCfg.Kernel.Type {
+		nlog.Core().Info(fmt.Sprintf("machine: auto-switching kernel for node %d (%s->%s, transport=%s)",
+			mn.ID, nodeCfg.Kernel.Type, resolved, cfgSnapshot.Network))
+		nodeCfg.Kernel.Type = resolved
+	}
+	// Reset cached ETag so the subsequent GetConfig in Initial() gets a full response.
+	perNodeClient.ResetConfigETag()
 
 	nodeCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 	mb := controlplane.NewNodeMailbox()
-	o.nodes[mn.ID] = &nodeHandle{cancel: cancel, done: done, mailbox: mb}
+	h := &nodeHandle{
+		cancel:   cancel,
+		done:     done,
+		mailbox:  mb,
+		mode:     taskModeService,
+		nodeType: mn.Type,
+	}
+
+	o.mu.Lock()
+	if _, exists := o.nodes[mn.ID]; exists {
+		o.mu.Unlock()
+		cancel()
+		return
+	}
+	o.nodes[mn.ID] = h
 	o.mu.Unlock()
 
 	o.eventsMu.Lock()
 	o.mailboxes[mn.ID] = mb
 	o.eventsMu.Unlock()
-
-	nodeCfg := o.cfg.ExpandMachineNode(mn.ID, mn.Type)
-
-	perNodeClient := o.client.ForNode(mn.ID)
-
-	// Pre-fetch node config to detect transport-based kernel requirements.
-	// If the transport (e.g. xhttp) is incompatible with the configured kernel
-	// (e.g. singbox), auto-switch to the required kernel for this node.
-	if cfgSnapshot, err := perNodeClient.GetConfig(); err == nil && cfgSnapshot != nil {
-		if resolved := model.ResolveKernelForTransport(cfgSnapshot.Network, nodeCfg.Kernel.Type); resolved != nodeCfg.Kernel.Type {
-			nlog.Core().Info(fmt.Sprintf("machine: auto-switching kernel for node %d (%s→%s, transport=%s)",
-				mn.ID, nodeCfg.Kernel.Type, resolved, cfgSnapshot.Network))
-			nodeCfg.Kernel.Type = resolved
-		}
-	}
-	// Reset cached ETag so the subsequent GetConfig in Initial() gets a full response.
-	perNodeClient.ResetConfigETag()
 
 	var push controlplane.PushClient
 	if o.ws != nil {
@@ -192,6 +263,7 @@ func (o *Orchestrator) stopNode(nodeID int) {
 
 	o.eventsMu.Lock()
 	delete(o.mailboxes, nodeID)
+	delete(o.statuses, nodeID)
 	o.eventsMu.Unlock()
 
 	nlog.Core().Info(fmt.Sprintf("machine: stopping node %d", nodeID))
@@ -236,8 +308,9 @@ func (o *Orchestrator) rediscover(ctx context.Context) {
 
 	o.mu.Lock()
 	var toRemove []int
-	for id := range o.nodes {
-		if _, ok := wanted[id]; !ok {
+	for id, h := range o.nodes {
+		n, ok := wanted[id]
+		if !ok || h.mode != normalizeTaskMode(n.Mode) || h.nodeType != n.Type {
 			toRemove = append(toRemove, id)
 		}
 	}
@@ -248,7 +321,7 @@ func (o *Orchestrator) rediscover(ctx context.Context) {
 	}
 
 	for _, n := range nodesResp.Nodes {
-		o.startNode(ctx, n) // no-op if already running
+		o.startNode(ctx, n) // no-op if already running with the same task mode
 	}
 }
 
@@ -291,11 +364,11 @@ func (o *Orchestrator) tryStartWS(ctx context.Context) {
 	o.ws = panel.NewWSClient(
 		hs.WebSocket.WSURL,
 		o.cfg.Machine.Token,
-		0, // no single node_id
+		0,
 		wsCfg,
 		o.onWSEvent,
 		o.onWSStatus,
-		nil, // per-node status is sent via machineNodePush
+		nil,
 	)
 
 	wsCtx, wsCancel := context.WithCancel(ctx)
@@ -305,10 +378,8 @@ func (o *Orchestrator) tryStartWS(ctx context.Context) {
 	nlog.Core().Info("machine: ws mux started")
 }
 
-// onWSEvent routes a WS event to the correct node's channel.
-// sync.nodes is a machine-level event that triggers immediate rediscovery.
+// onWSEvent routes a WS event to the correct machine task.
 func (o *Orchestrator) onWSEvent(event panel.WSEvent) {
-	// sync.nodes is a machine-level event, not per-node
 	if event.Type == panel.WSEventSyncNodes {
 		nlog.Core().Info("machine received sync.nodes, triggering immediate rediscovery")
 		go o.rediscover(o.runCtx)
@@ -318,6 +389,26 @@ func (o *Orchestrator) onWSEvent(event panel.WSEvent) {
 	nodeID := event.NodeID
 	if nodeID == 0 {
 		nlog.Core().Debug("machine ws event missing node_id, dropping", "type", event.Type)
+		return
+	}
+
+	// Relay tasks consume config updates only. User/device events are deliberately
+	// ignored because authentication and accounting remain on the parent service.
+	o.mu.Lock()
+	h := o.nodes[nodeID]
+	o.mu.Unlock()
+	if h != nil && h.mode == taskModeRelay {
+		if event.Type == panel.WSEventSyncConfig && event.Config != nil && h.relayUpdates != nil {
+			select {
+			case h.relayUpdates <- event.Config:
+			default:
+				select {
+				case <-h.relayUpdates:
+				default:
+				}
+				h.relayUpdates <- event.Config
+			}
+		}
 		return
 	}
 
@@ -338,7 +429,7 @@ func (o *Orchestrator) onWSEvent(event panel.WSEvent) {
 	mailbox.Apply(translated)
 }
 
-// onWSStatus broadcasts WS connectivity changes to all registered nodes.
+// onWSStatus broadcasts WS connectivity changes to all registered service nodes.
 func (o *Orchestrator) onWSStatus(status panel.WSStatusChange) {
 	change := controlplane.StatusChange{Connected: status.Connected}
 	o.eventsMu.RLock()
@@ -377,17 +468,12 @@ func (o *Orchestrator) applyIntervals(bc panel.MachineBaseConfig) {
 
 // ─── Virtual PushClient ─────────────────────────────────────────────────
 
-// machineNodePush implements controlplane.PushClient for a single node
-// backed by the shared machine WS connection. Events are routed by the
-// WS mux directly to the Service's channels; this adapter only provides
-// connectivity status and send capabilities.
 type machineNodePush struct {
 	nodeID int
 	ws     *panel.WSClient
 }
 
 func (p *machineNodePush) Run(ctx context.Context) {
-	// The shared WS mux pushes events into our channels; we just wait.
 	<-ctx.Done()
 }
 
@@ -402,7 +488,6 @@ func (p *machineNodePush) SendDeviceReport(devices map[int][]string) {
 	payload := map[string]interface{}{
 		"node_id": p.nodeID,
 	}
-	// Flatten into the standard format with node_id wrapper.
 	strDevices := make(map[string][]string, len(devices))
 	for uid, ips := range devices {
 		strDevices[fmt.Sprintf("%d", uid)] = ips
