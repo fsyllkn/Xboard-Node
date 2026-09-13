@@ -62,7 +62,9 @@ func (o *Orchestrator) runRelayNode(
 	}
 
 	runErr := make(chan error, 1)
+	runDone := make(chan struct{})
 	go func() {
+		defer close(runDone)
 		runErr <- runner.Run(ctx)
 	}()
 
@@ -101,6 +103,11 @@ func (o *Orchestrator) runRelayNode(
 	for {
 		select {
 		case <-ctx.Done():
+			// runner.Run closes the listener and waits for all relay connections in
+			// its deferred instance cleanup. Wait for that cleanup before the
+			// orchestrator is allowed to start the replacement task on the same
+			// port.
+			<-runDone
 			return nil
 		case err := <-runErr:
 			return err

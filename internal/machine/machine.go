@@ -181,6 +181,7 @@ func (o *Orchestrator) startNode(ctx context.Context, mn panel.MachineNode) {
 			if err := o.runRelayNode(nodeCtx, mn, perNodeClient, cfgSnapshot, updates); err != nil {
 				nlog.Core().Error("machine relay exited with error",
 					"node_id", mn.ID, "error", err)
+				o.removeStoppedNode(mn.ID, h)
 			}
 		}()
 		return
@@ -249,6 +250,24 @@ func (o *Orchestrator) startNode(ctx context.Context, mn panel.MachineNode) {
 				"node_id", mn.ID, "error", err)
 		}
 	}()
+}
+
+// removeStoppedNode removes a task that exited by itself. A dead task must not
+// remain in o.nodes, otherwise discovery treats it as healthy forever and will
+// never retry it (for example after a transient port conflict).
+func (o *Orchestrator) removeStoppedNode(nodeID int, handle *nodeHandle) {
+	o.mu.Lock()
+	if o.nodes[nodeID] != handle {
+		o.mu.Unlock()
+		return
+	}
+	delete(o.nodes, nodeID)
+	o.mu.Unlock()
+
+	o.eventsMu.Lock()
+	delete(o.mailboxes, nodeID)
+	delete(o.statuses, nodeID)
+	o.eventsMu.Unlock()
 }
 
 func (o *Orchestrator) stopNode(nodeID int) {
