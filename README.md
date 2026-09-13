@@ -1,6 +1,6 @@
 # xboard-node
 
-Node backend for [Xboard](https://github.com/cedar2025/Xboard). Supports `sing-box` / `xray-core` dual kernels.
+Node backend for [fsyllkn/Xboard](https://github.com/fsyllkn/Xboard). Supports `sing-box` / `xray-core` dual kernels.
 
 > **Disclaimer**: This project is for educational and learning purposes only.
 
@@ -11,6 +11,7 @@ Node backend for [Xboard](https://github.com/cedar2025/Xboard). Supports `sing-b
 - User controls: speed limit, device limit, alive-IP tracking, hot update
 - Deploy modes: node mode, machine mode, standalone mode
 - Multi-instance: single process binding multiple panels / nodes
+- Native relay: managed TCP/UDP relay tasks in machine mode
 
 ## Install
 
@@ -19,14 +20,14 @@ Node backend for [Xboard](https://github.com/cedar2025/Xboard). Supports `sing-b
 ```bash
 docker run -d --restart=always --network=host \
   -e apiHost=https://panel.com -e apiKey=TOKEN -e nodeID=1 \
-  ghcr.io/cedar2025/xboard-node:latest
+  ghcr.io/fsyllkn/xboard-node:latest
 ```
 
 ### Docker Compose
 
 ```bash
-git clone -b compose --depth 1 https://github.com/cedar2025/xboard-node.git
-cd xboard-node
+git clone -b compose --depth 1 https://github.com/fsyllkn/Xboard-Node.git
+cd Xboard-Node
 vim config/config.yml   # set panel.url / token / node_id
 docker compose up -d
 ```
@@ -34,12 +35,13 @@ docker compose up -d
 ### Installer (Linux systemd)
 
 ```bash
+# The fork installer builds the dev branch by default, so no Release is required.
 # Node mode
-curl -fsSL https://raw.githubusercontent.com/cedar2025/xboard-node/dev/install.sh | \
+curl -fsSL https://raw.githubusercontent.com/fsyllkn/Xboard-Node/dev/install.sh | \
   sudo bash -s -- --mode node --panel https://panel.example.com --token TOKEN --node-id 1
 
 # Machine mode
-curl -fsSL https://raw.githubusercontent.com/cedar2025/xboard-node/dev/install.sh | \
+curl -fsSL https://raw.githubusercontent.com/fsyllkn/Xboard-Node/dev/install.sh | \
   sudo bash -s -- --mode machine --panel https://panel.example.com --token TOKEN --machine-id 1
 
 ## xbctl

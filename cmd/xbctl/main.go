@@ -30,7 +30,8 @@ const (
 	serviceName            = "xboard-node.service"
 	serviceFilePath        = "/etc/systemd/system/xboard-node.service"
 	defaultInstallRoot     = "/etc/xboard-node"
-	downloadBase           = "https://github.com/cedar2025/xboard-node/releases"
+	downloadBase           = "https://github.com/fsyllkn/Xboard-Node/releases"
+	installerPath          = "/etc/xboard-node/install.sh"
 )
 
 var (
@@ -54,7 +55,7 @@ type fileRootConfig struct {
 	WS        *config.WSConfig   `yaml:"ws,omitempty"`
 	Runtime   *fileRuntimeConfig `yaml:"runtime,omitempty"`
 	Cert      *config.CertConfig `yaml:"cert,omitempty"`
-	Instances []fileInstance      `yaml:"instances,omitempty"`
+	Instances []fileInstance     `yaml:"instances,omitempty"`
 }
 
 type fileInstance struct {
@@ -385,6 +386,11 @@ func runUpgrade(args []string) error {
 	if err := ensureRoot("upgrade"); err != nil {
 		return err
 	}
+	if installerScriptAvailable(installerPath) {
+		fmt.Println("Using fsyllkn/Xboard-Node source installer for upgrade...")
+		installerArgs := append([]string{installerPath, "upgrade"}, args...)
+		return runCommand("bash", installerArgs...)
+	}
 
 	version := "latest"
 	for i := 0; i < len(args); i++ {
@@ -597,6 +603,14 @@ func resolveDownloadURL(artifact, version string) string {
 		return downloadBase + "/latest/download/" + artifact
 	}
 	return downloadBase + "/download/" + version + "/" + artifact
+}
+
+func installerScriptAvailable(path string) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	return bytes.Contains(data, []byte("FORK_REPOSITORY_URL="))
 }
 
 func downloadFile(url, dest string) error {
@@ -1157,7 +1171,7 @@ func latestInstanceID(instances []*config.Config) string {
 func regenerateServiceFile() error {
 	unit := fmt.Sprintf(`[Unit]
 Description=Xboard Node Backend
-Documentation=https://github.com/cedar2025/xboard-node
+Documentation=https://github.com/fsyllkn/Xboard-Node
 After=network-online.target
 Wants=network-online.target
 

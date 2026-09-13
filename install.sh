@@ -27,7 +27,11 @@ DEFAULT_ACTION="install"
 DEFAULT_RELEASE_VERSION="latest"
 DEFAULT_LOG_LEVEL="info"
 DEFAULT_KERNEL_LOG_LEVEL="warn"
-DEFAULT_DOWNLOAD_BASE="https://github.com/cedar2025/xboard-node/releases"
+FORK_REPOSITORY_URL="https://github.com/fsyllkn/Xboard-Node.git"
+FORK_BRANCH="${XBOARD_NODE_BRANCH:-dev}"
+FORK_INSTALLER_URL="https://raw.githubusercontent.com/fsyllkn/Xboard-Node/${FORK_BRANCH}/install.sh"
+DEFAULT_DOWNLOAD_BASE="https://github.com/fsyllkn/Xboard-Node/releases"
+DEFAULT_GO_VERSION="${XBOARD_GO_VERSION:-1.26.8}"
 
 ACTION="${DEFAULT_ACTION}"
 MODE=""
@@ -38,6 +42,7 @@ NODE_TYPE=""
 MACHINE_ID=""
 KERNEL_TYPE="${DEFAULT_KERNEL}"
 RELEASE_VERSION="${DEFAULT_RELEASE_VERSION}"
+BUILD_FROM_SOURCE=1
 HEALTH_PORT="${DEFAULT_HEALTH_PORT}"
 HEALTH_ENABLED=1
 RUNTIME_GOMEMLIMIT=""
@@ -53,8 +58,13 @@ DOWNLOAD_URL=""
 CURRENT_STATE="fresh"
 TMP_DIR=""
 BACKUP_PATH=""
+SOURCE_DIR=""
+GO_BIN=""
+BUILD_WITH_DOCKER=0
+SOURCE_BUILD_DONE=0
 SERVICE_EXISTED=0
 CLEANUP_DONE=0
+SCRIPT_SOURCE="${BASH_SOURCE[0]:-}"
 
 log_info()  { echo -e "${GREEN}[INFO]${NC} $1"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
@@ -186,6 +196,9 @@ usage() {
   OPTIONAL:
     --node-type, -T     Explicit node type for node mode
     --kernel, -k        singbox or xray (default: singbox)
+    --branch            Fork source branch (default: dev, env: XBOARD_NODE_BRANCH)
+    --source            Build from the fork source (default)
+    --release           Download a fork Release asset instead of building
     --version           Release version or latest (default: latest)
     --binary            Use a local xboard-node binary path instead of downloading
     --xbctl-binary      Use a local xbctl binary path instead of downloading
@@ -240,6 +253,19 @@ parse_args() {
             --kernel|-k)
                 KERNEL_TYPE="$2"
                 shift 2
+                ;;
+            --branch)
+                FORK_BRANCH="$2"
+                FORK_INSTALLER_URL="https://raw.githubusercontent.com/fsyllkn/Xboard-Node/${FORK_BRANCH}/install.sh"
+                shift 2
+                ;;
+            --source)
+                BUILD_FROM_SOURCE=1
+                shift
+                ;;
+            --release)
+                BUILD_FROM_SOURCE=0
+                shift
                 ;;
             --version)
                 RELEASE_VERSION="$2"
@@ -379,13 +405,13 @@ install_dependencies() {
     case "$OS" in
         ubuntu|debian)
             DEBIAN_FRONTEND=noninteractive run_with_retry 10 3 apt-get update -qq
-            DEBIAN_FRONTEND=noninteractive run_with_retry 10 3 apt-get install -y -qq curl wget ca-certificates >/dev/null 2>&1
+            DEBIAN_FRONTEND=noninteractive run_with_retry 10 3 apt-get install -y -qq curl wget ca-certificates git tar >/dev/null 2>&1
             ;;
         centos|rhel|rocky|almalinux|fedora)
             if command -v dnf >/dev/null 2>&1; then
-                run_with_retry 5 3 dnf install -y -q curl wget ca-certificates >/dev/null 2>&1
+                run_with_retry 5 3 dnf install -y -q curl wget ca-certificates git tar >/dev/null 2>&1
             else
-                run_with_retry 5 3 yum install -y -q curl wget ca-certificates >/dev/null 2>&1
+                run_with_retry 5 3 yum install -y -q curl wget ca-certificates git tar >/dev/null 2>&1
             fi
             ;;
         *)
@@ -415,6 +441,10 @@ validate_install_request() {
     fi
     if [ -z "$TOKEN" ]; then
         log_error "Token is required"
+        exit 1
+    fi
+    if [ -z "$FORK_BRANCH" ]; then
+        log_error "Fork source branch is required"
         exit 1
     fi
     if ! [[ "$HEALTH_PORT" =~ ^[0-9]+$ ]]; then
@@ -480,6 +510,129 @@ select_binary_source() {
     echo ""
 }
 
+go_version_supported() {
+    local go_cmd="$1"
+    local version major minor
+    version=$("$go_cmd" version 2>/dev/null | sed -n 's/^go version go\([0-9][0-9.]*\).*/\1/p')
+    [ -n "$version" ] || return 1
+    major="${version%%.*}"
+    version="${version#*.}"
+    minor="${version%%.*}"
+    if [ "$major" -gt 1 ] 2>/dev/null; then
+        return 0
+    fi
+    [ "$major" -eq 1 ] 2>/dev/null && [ "$minor" -ge 26 ] 2>/dev/null
+}
+
+docker_available() {
+    command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1
+}
+
+install_go_toolchain() {
+    local go_root="/usr/local/lib/xboard-go-${DEFAULT_GO_VERSION}"
+    local archive="$TMP_DIR/go${DEFAULT_GO_VERSION}.tar.gz"
+
+    if [ -x "$go_root/bin/go" ] && go_version_supported "$go_root/bin/go"; then
+        GO_BIN="$go_root/bin/go"
+        return
+    fi
+
+    log_step "Downloading Go ${DEFAULT_GO_VERSION} toolchain"
+    if ! curl -fsSL "https://go.dev/dl/go${DEFAULT_GO_VERSION}.linux-${ARCH}.tar.gz" -o "$archive"; then
+        log_error "Failed to download Go ${DEFAULT_GO_VERSION} for ${ARCH}"
+        exit 1
+    fi
+    mkdir -p "$go_root"
+    if ! tar -xzf "$archive" -C "$go_root" --strip-components=1; then
+        log_error "Failed to unpack Go ${DEFAULT_GO_VERSION}"
+        exit 1
+    fi
+    GO_BIN="$go_root/bin/go"
+}
+
+ensure_build_toolchain() {
+    local host_go
+    host_go=$(command -v go 2>/dev/null || true)
+    if [ -n "$host_go" ] && go_version_supported "$host_go"; then
+        GO_BIN="$host_go"
+        BUILD_WITH_DOCKER=0
+        return
+    fi
+    if docker_available; then
+        BUILD_WITH_DOCKER=1
+        return
+    fi
+    install_go_toolchain
+    BUILD_WITH_DOCKER=0
+}
+
+build_from_source() {
+    if [ "$SOURCE_BUILD_DONE" -eq 1 ]; then
+        return
+    fi
+
+    if ! command -v git >/dev/null 2>&1; then
+        log_error "git is required to build ${FORK_REPOSITORY_URL}"
+        exit 1
+    fi
+
+    SOURCE_DIR="$TMP_DIR/source"
+    local local_repo=""
+    if [ -n "$SCRIPT_SOURCE" ] && [ -f "$SCRIPT_SOURCE" ]; then
+        local_repo=$(cd "$(dirname "$SCRIPT_SOURCE")" && pwd)
+    fi
+    if [ -f "$local_repo/go.mod" ] && [ -f "$local_repo/cmd/xboard-node/main.go" ]; then
+        SOURCE_DIR="$local_repo"
+        log_step "Building local fork checkout: ${SOURCE_DIR}"
+    else
+        log_step "Cloning ${FORK_REPOSITORY_URL} (${FORK_BRANCH})"
+        if ! git clone --depth 1 --branch "$FORK_BRANCH" "$FORK_REPOSITORY_URL" "$SOURCE_DIR"; then
+            log_error "Failed to clone fork branch ${FORK_BRANCH}"
+            exit 1
+        fi
+    fi
+
+    ensure_build_toolchain
+    local commit_label version_label build_time ldflags
+    commit_label=$(git -C "$SOURCE_DIR" rev-parse --short HEAD)
+    version_label="$RELEASE_VERSION"
+    if [ "$version_label" = "latest" ]; then
+        version_label="dev-${commit_label}"
+    fi
+    build_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    ldflags="-s -w -X main.version=${version_label} -X main.buildTime=${build_time}"
+
+    if [ "$BUILD_WITH_DOCKER" -eq 1 ]; then
+        log_step "Building fork binaries with Docker"
+        if ! docker run --rm \
+            -e "TARGET_GOARCH=${ARCH}" \
+            -e "BUILD_VERSION=${version_label}" \
+            -e "BUILD_TIME=${build_time}" \
+            -v "${SOURCE_DIR}:/src" \
+            -v "${TMP_DIR}:/out" \
+            -w /src \
+            golang:1.26-alpine \
+            sh -lc 'export PATH=/usr/local/go/bin:$PATH; CGO_ENABLED=0 GOOS=linux GOARCH="$TARGET_GOARCH" go build -ldflags "-s -w -X main.version=${BUILD_VERSION} -X main.buildTime=${BUILD_TIME}" -tags "with_quic with_utls with_wireguard with_acme with_clash_api" -o /out/xboard-node ./cmd/xboard-node && CGO_ENABLED=0 GOOS=linux GOARCH="$TARGET_GOARCH" go build -ldflags "-s -w -X main.version=${BUILD_VERSION} -X main.buildTime=${BUILD_TIME}" -o /out/xbctl ./cmd/xbctl'; then
+            log_error "Fork source build failed"
+            exit 1
+        fi
+    else
+        log_step "Building fork binaries with ${GO_BIN}"
+        if ! (cd "$SOURCE_DIR" && \
+            CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" "$GO_BIN" build -ldflags "$ldflags" -tags "with_quic with_utls with_wireguard with_acme with_clash_api" -o "$TMP_DIR/xboard-node" ./cmd/xboard-node && \
+            CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" "$GO_BIN" build -ldflags "$ldflags" -o "$TMP_DIR/xbctl" ./cmd/xbctl); then
+            log_error "Fork source build failed"
+            exit 1
+        fi
+    fi
+
+    [ -x "$TMP_DIR/xboard-node" ] && [ -x "$TMP_DIR/xbctl" ] || {
+        log_error "Fork source build did not produce both binaries"
+        exit 1
+    }
+    SOURCE_BUILD_DONE=1
+}
+
 resolve_download_url() {
     local artifact="$1"
     if [ "$RELEASE_VERSION" = "latest" ]; then
@@ -496,6 +649,10 @@ stage_binary() {
     if [ -n "$local_src" ]; then
         log_step "Using local binary: ${local_src}"
         cp "$local_src" "$staged"
+    elif [ "$BUILD_FROM_SOURCE" -eq 1 ]; then
+        build_from_source
+        log_step "Using fork source binary: ${FORK_REPOSITORY_URL}@${FORK_BRANCH}"
+        cp "$TMP_DIR/xboard-node" "$staged"
     else
         resolve_download_url "xboard-node-linux-${ARCH}"
         log_step "Downloading binary: ${DOWNLOAD_URL}"
@@ -528,6 +685,10 @@ stage_xbctl() {
     if [ -n "$local_src" ]; then
         log_step "Using local xbctl binary: ${local_src}"
         cp "$local_src" "$staged"
+    elif [ "$BUILD_FROM_SOURCE" -eq 1 ]; then
+        build_from_source
+        log_step "Using fork source xbctl: ${FORK_REPOSITORY_URL}@${FORK_BRANCH}"
+        cp "$TMP_DIR/xbctl" "$staged"
     else
         resolve_download_url "xbctl-linux-${ARCH}"
         log_step "Downloading xbctl: ${DOWNLOAD_URL}"
@@ -592,7 +753,7 @@ render_service() {
     cat >"$TMP_DIR/${SERVICE_NAME}" <<EOF_UNIT
 [Unit]
 Description=Xboard Node Backend
-Documentation=https://github.com/cedar2025/xboard-node
+Documentation=https://github.com/fsyllkn/Xboard-Node
 After=network-online.target
 Wants=network-online.target
 
@@ -645,15 +806,32 @@ stop_existing_service() {
     fi
 }
 
+install_installer_copy() {
+    local script_source="${BASH_SOURCE[0]:-}"
+    if [ -f "$script_source" ] && grep -q '^FORK_REPOSITORY_URL=' "$script_source"; then
+        install -m 755 "$script_source" "$INSTALLER_COPY_PATH"
+        return
+    fi
+
+    # When invoked as `curl ... | sudo bash -s`, $0 is bash and cannot be
+    # copied. Save a fresh copy from the fork so `xbctl upgrade` can reuse the
+    # same source-build path later.
+    local downloaded="$TMP_DIR/install.sh"
+    if curl -fsSL "$FORK_INSTALLER_URL" -o "$downloaded" \
+        && grep -q '^FORK_REPOSITORY_URL=' "$downloaded"; then
+        install -m 755 "$downloaded" "$INSTALLER_COPY_PATH"
+    else
+        log_warn "Could not save the fork installer for future upgrades"
+    fi
+}
+
 install_staged_files() {
     stop_existing_service
     install -m 755 "$TMP_DIR/xboard-node" "$BINARY_PATH"
     install -m 600 "$TMP_DIR/config.yml" "$CONFIG_FILE"
     install -m 600 "$TMP_DIR/credentials.env" "$CREDENTIALS_FILE"
     install -m 644 "$TMP_DIR/install-meta.json" "$INSTALL_META"
-    if [ -f "$0" ] && [ "$(realpath "$0")" != "$(realpath "$INSTALLER_COPY_PATH" 2>/dev/null || echo "$INSTALLER_COPY_PATH")" ]; then
-        install -m 755 "$0" "$INSTALLER_COPY_PATH"
-    fi
+    install_installer_copy
     install -m 755 "$TMP_DIR/xbctl" "$CLI_PATH"
     ln -sf "$CLI_PATH" /usr/bin/xbctl 2>/dev/null || true
     install -m 644 "$TMP_DIR/${SERVICE_NAME}" "$SERVICE_PATH"
