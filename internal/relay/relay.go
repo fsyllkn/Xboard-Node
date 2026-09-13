@@ -72,13 +72,13 @@ func (c Config) targetKey() string {
 type Metrics struct {
 	ActiveTCPConnections int64
 	TotalTCPConnections  uint64
-	TCPDialErrors         uint64
-	TCPBytesUp            uint64
-	TCPBytesDown          uint64
-	ActiveUDPSessions     int64
-	TotalUDPSessions      uint64
-	UDPBytesUp            uint64
-	UDPBytesDown          uint64
+	TCPDialErrors        uint64
+	TCPBytesUp           uint64
+	TCPBytesDown         uint64
+	ActiveUDPSessions    int64
+	TotalUDPSessions     uint64
+	UDPBytesUp           uint64
+	UDPBytesDown         uint64
 }
 
 type Runner struct {
@@ -149,12 +149,30 @@ func (r *Runner) Run(ctx context.Context) error {
 			return nil
 		case next := <-r.updates:
 			if next.listenKey() != current.listenKey() {
-				replacement, err := r.startInstance(ctx, next)
-				if err != nil {
-					continue
+				sameEndpoint := next.ListenIP == current.ListenIP && next.ListenPort == current.ListenPort
+				if sameEndpoint {
+					// Changing TCP/UDP listeners on the same port requires releasing the old
+					// socket first. Restore the old config if the replacement cannot start.
+					inst.close()
+					replacement, err := r.startInstance(ctx, next)
+					if err != nil {
+						restored, restoreErr := r.startInstance(ctx, current)
+						if restoreErr != nil {
+							return fmt.Errorf("relay listener update failed: %v; restore failed: %w", err, restoreErr)
+						}
+						inst = restored
+						continue
+					}
+					inst = replacement
+				} else {
+					replacement, err := r.startInstance(ctx, next)
+					if err != nil {
+						// Keep the old, working listener alive if the replacement fails.
+						continue
+					}
+					inst.close()
+					inst = replacement
 				}
-				inst.close()
-				inst = replacement
 			} else if next.targetKey() != current.targetKey() || next.UDPIdleTimeout != current.UDPIdleTimeout {
 				inst.update(next)
 			}
@@ -174,11 +192,14 @@ type instance struct {
 	tcpLn net.Listener
 	udp   *udpRelay
 	wg    sync.WaitGroup
+
+	connMu sync.Mutex
+	conns  map[net.Conn]struct{}
 }
 
 func (r *Runner) startInstance(parent context.Context, cfg Config) (*instance, error) {
 	ctx, cancel := context.WithCancel(parent)
-	inst := &instance{runner: r, ctx: ctx, cancel: cancel, cfg: cfg}
+	inst := &instance{runner: r, ctx: ctx, cancel: cancel, cfg: cfg, conns: make(map[net.Conn]struct{})}
 
 	var tcpLn net.Listener
 	var udpConn *net.UDPConn
@@ -257,7 +278,32 @@ func (i *instance) close() {
 	if i.udp != nil {
 		i.udp.close()
 	}
+	i.closeConnections()
 	i.wg.Wait()
+}
+
+func (i *instance) trackConn(conn net.Conn) {
+	i.connMu.Lock()
+	i.conns[conn] = struct{}{}
+	i.connMu.Unlock()
+}
+
+func (i *instance) untrackConn(conn net.Conn) {
+	i.connMu.Lock()
+	delete(i.conns, conn)
+	i.connMu.Unlock()
+}
+
+func (i *instance) closeConnections() {
+	i.connMu.Lock()
+	conns := make([]net.Conn, 0, len(i.conns))
+	for conn := range i.conns {
+		conns = append(conns, conn)
+	}
+	i.connMu.Unlock()
+	for _, conn := range conns {
+		_ = conn.Close()
+	}
 }
 
 func (i *instance) serveTCP() {
@@ -273,10 +319,12 @@ func (i *instance) serveTCP() {
 		}
 		i.runner.totalTCP.Add(1)
 		i.runner.activeTCP.Add(1)
+		i.trackConn(conn)
 		i.wg.Add(1)
 		go func(client net.Conn) {
 			defer i.wg.Done()
 			defer i.runner.activeTCP.Add(-1)
+			defer i.untrackConn(client)
 			defer client.Close()
 			i.handleTCP(client)
 		}(conn)
@@ -290,6 +338,8 @@ func (i *instance) handleTCP(client net.Conn) {
 		i.runner.tcpErrors.Add(1)
 		return
 	}
+	i.trackConn(upstream)
+	defer i.untrackConn(upstream)
 	defer upstream.Close()
 
 	var wg sync.WaitGroup
