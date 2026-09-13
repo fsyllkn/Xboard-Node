@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches: [main, master, dev]
-    tags: ["v*"]
+    tags: ["v*", "dev"]
   pull_request:
     branches: [main, master]
 
@@ -122,7 +122,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'dev' }}
-          make_latest: ${{ startsWith(github.ref, 'refs/tags/') }}
+          make_latest: ${{ startsWith(github.ref, 'refs/tags/v') }}
           files: |
             dist/xboard-node-linux-amd64
             dist/xboard-node-linux-arm64
