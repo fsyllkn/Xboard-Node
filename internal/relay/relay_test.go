@@ -96,6 +96,42 @@ func TestTCPRelayAndTargetUpdate(t *testing.T) {
 	}
 }
 
+func TestTCPRelayListenPortUpdate(t *testing.T) {
+	b, stop := startTCPServer(t, "backend:")
+	defer stop()
+	a1 := freePort(t, "tcp")
+	a2 := freePort(t, "tcp")
+	r, err := New(Config{ListenIP: "127.0.0.1", ListenPort: a1, TargetHost: "127.0.0.1", TargetPort: b, Networks: []string{"tcp"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		if err := r.Run(ctx); err != nil {
+			t.Errorf("run: %v", err)
+		}
+	}()
+	waitTCP(t, a1)
+	if err := r.Update(Config{ListenIP: "127.0.0.1", ListenPort: a2, TargetHost: "127.0.0.1", TargetPort: b, Networks: []string{"tcp"}}); err != nil {
+		t.Fatal(err)
+	}
+	waitTCP(t, a2)
+	if got := tcpRoundTrip(t, a2, "hello"); got != "backend:hello" {
+		t.Fatalf("got %q", got)
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", a1), 50*time.Millisecond)
+		if err != nil {
+			return
+		}
+		_ = c.Close()
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("old relay listener remained open after port update")
+}
+
 func tcpRoundTrip(t *testing.T, port int, payload string) string {
 	t.Helper()
 	c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), time.Second)
